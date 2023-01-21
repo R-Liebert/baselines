@@ -11,13 +11,198 @@ from baselines.common.cg import cg
 from baselines.common.input import observation_placeholder
 from baselines.common.policies import build_policy
 from contextlib import contextmanager
+import os
 
 try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
 
-def traj_segment_generator(pi, env, horizon, stochastic):
+# The following five functions are specific for LOKI and not original for baselines.
+
+def batch_value_prediction(pi, obz):
+    """
+    Calculate value predictions for a batch of observations using a trained Tensorflow model.
+    
+    Parameters
+    ----------
+    pi : tf.Session
+        Tensorflow session with a trained model.
+    obz : numpy array
+        Array of observations to make value predictions for.
+    
+    Returns
+    -------
+    vpreds : numpy array
+        Array of value predictions for each observation in obz.
+    """
+    # Determine number of samples and initialize array to hold value predictions
+    n_samples = len(obz)
+    vpreds = np.zeros(n_samples, 'float32')
+    
+    # Set batch size and create dataset from input array
+    batch_size = 2048
+    dataset = tf.data.Dataset.from_tensor_slices(obz)
+    dataset = dataset.batch(batch_size)
+    
+    # Get iterator and placeholder for observations
+    iterator = dataset.make_initializable_iterator()
+    ob_ph = iterator.get_next()
+    
+    # Initialize iterator and make value predictions for each batch
+    pi.run(iterator.initializer)
+    while True:
+        try:
+            vpreds_batch = pi.vpred.eval(feed_dict={ob_ph: ob_ph.eval()})
+            vpreds = np.concatenate((vpreds, vpreds_batch))
+        except tf.errors.OutOfRangeError:
+            break
+    
+    return vpreds
+
+def create_saver(pi, for_expert=False):
+    """
+    Create a saver for the policy network. 
+    If for_expert is set to True, the saver will be able to save variables for expert policy. 
+    This is done by creating a dictionary with keys as the names of variables in the expert policy, 
+    and values as the variables in the pi policy. 
+    
+    Args:
+        pi (tf.keras.Model): The policy network.
+        for_expert (bool, optional): Whether to create a saver for expert policy. Defaults to False.
+        
+    Returns:
+        tf.train.Saver: The saver for the policy network.
+        
+    Example:
+        >>> pi = create_policy_network()
+        >>> saver = create_saver(pi)
+        >>> saver
+        <tensorflow.python.training.saver.Saver object at 0x7f8f9cf938d0>
+    """
+    # Create saver, need to include some non-trainable variables, such as running mean std stuff.
+    pi_mlp_var_list = pi.get_variables()
+    if for_expert:
+        # Since saved variables have names started with pi/, we work around it by creating a dictionary something like:
+        # {"pi/pol/kernel": expert policy var, ...}
+        pi_mlp_var_dict = {}
+        for var in pi_mlp_var_list:
+            splits = var.name.split("/")
+            splits[0] = "pi"
+            saved_var_name = "/".join(splits)
+            # It's weird that the variables saved in the checkpoint do not have ":0", but var.name has,
+            # although this ":0" works for pi, but not expert. We need to manually remove it.
+            assert saved_var_name.split(":")[1] == "0"  # make sure it's :0
+            saved_var_name = saved_var_name.split(":")[0]
+            pi_mlp_var_dict[saved_var_name] = var
+        pi_mlp_var_list = pi_mlp_var_dict  # a little abuse of list
+    saver = tf.train.Saver(pi_mlp_var_list, max_to_keep=50)
+    print(f'Create saver for expert: {for_expert}')
+    return saver
+
+# This function might be changed for a constant
+def compute_max_kl(ilrate):
+    """
+    Compute the maximum KL divergence for the given ilrate.
+
+    Parameters:
+    ----------
+    ilrate : float
+        Interpolation rate between imitation learning and reinforcement learning. 
+        ilrate = 1.0 means using the KL divergence for imitation learning and 
+        ilrate = 0.0 means using the KL divergence for reinforcement learning.
+
+    Returns:
+    -------
+    max_kl : float
+        The maximum KL divergence for the given ilrate.
+
+    Example:
+    --------
+    >>> compute_max_kl(1.0)
+    0.1
+    >>> compute_max_kl(0.0)
+    0.01
+    >>> compute_max_kl(0.5)
+    ValueError: Unknow max_kl, ilrate: 0.5
+    """
+    # Hard code the KL constraints for IL and RL.
+    RL_MAX_KL = 0.01
+    IL_MAX_KL = 0.1
+    if np.isclose(ilrate, 1.0):
+        max_kl = IL_MAX_KL
+    elif np.isclose(ilrate, 0.0):
+        max_kl = RL_MAX_KL
+    else:
+        raise ValueError(f'Unknow max_kl, ilrate: {ilrate}')
+    return max_kl
+
+def compute_ilrate(ilrate_multi, iters, ilrate_decay=None, hard_switch_iter=None):
+    """
+    Compute the ilrate (imitation learning rate) based on the specified parameters.
+    
+    Parameters
+    ----------
+    ilrate_multi : float
+        The initial value for the ilrate.
+    iters : int
+        The current number of iterations.
+    ilrate_decay : float, optional
+        The decay rate for the ilrate. Default is None.
+    hard_switch_iter : int, optional
+        The iteration number at which the ilrate switches from 1.0 to 0.0. Default is None.
+        
+    Returns
+    -------
+    float
+        The computed ilrate.
+        
+    Examples
+    --------
+    >>> compute_ilrate(1.0, 5)
+    1.0
+    >>> compute_ilrate(1.0, 5, ilrate_decay=0.9)
+    0.531441
+    >>> compute_ilrate(1.0, 5, hard_switch_iter=3)
+    0.0
+    """
+    if hard_switch_iter is not None:
+        # Hard switch
+        if iters < hard_switch_iter:
+            ilrate = 1.0
+        else:
+            ilrate = 0.0
+    elif ilrate_decay is not None:
+        # Mixing
+        ilrate = ilrate_multi * ilrate_decay ** iters  # exponential
+    else:
+        ilrate = ilrate_multi
+    return ilrate
+
+def add_expert_v(expert, seg):
+    """
+    Add the expert's value predictions to the given segment of data.
+
+    Parameters
+    ----------
+    expert: object
+        The expert policy object with a `act` method to make value predictions.
+    seg: dict
+        A segment of data containing observations and actions, in the format of 
+        {"ob": observation, "ac": action, "nextob": next_observation}.
+
+    Returns
+    -------
+    None
+    """
+    # Compute value predictions for the expert's actions taken in each step of the segment
+    expert_v = batch_value_prediction(expert, seg["ob"])
+    # Append the value prediction for the expert's action taken in the next step
+    expert_v = np.append(expert_v, expert.act(True, seg["nextob"])[1])
+    # Add the expert's value predictions to the segment
+    seg["expert_v"] = expert_v
+
+def traj_segment_generator(pi, env, horizon, stochastic=True, expert=False):
     # Initialize state variables
     t = 0
     ac = env.action_space.sample()
@@ -34,21 +219,34 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     obs = np.array([ob for _ in range(horizon)])
     rews = np.zeros(horizon, 'float32')
     vpreds = np.zeros(horizon, 'float32')
+    # Indicates whether this sample is the first of a new episode / rollout.
     news = np.zeros(horizon, 'int32')
     acs = np.array([ac for _ in range(horizon)])
     prevacs = acs.copy()
 
     while True:
         prevac = ac
-        ac, vpred, _, _ = pi.step(ob, stochastic=stochastic)
+        # In the original LOKI script there was an older version of baselines which used
+        # pi.act(stochastic, ob) instead of cfc_step(ob,  stochastic). The update was made to 
+        # introduce more flexibility and allow for the use of recurrent policies.
+        # This is found through the whole script, but in TRPO it's only ac and vpred being used.
+        # So there is noe effect on the results when used on the policy.
+        if expert:
+            ac, vpred, _, _ = pi.act(stochastic, ob)
+        else:
+            ac, vpred, _, _ = pi.act(stochastic, ob)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if t > 0 and t % horizon == 0:
+            # In LOKI the nextob and nextnew are added here
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
-                    "ep_rets" : ep_rets, "ep_lens" : ep_lens}
-            _, vpred, _, _ = pi.step(ob, stochastic=stochastic)
+                    "ep_rets" : ep_rets, "ep_lens" : ep_lens, "nextob": ob, "nextnew": new}
+            if expert:
+                _ , vpred, _, _ = pi.act(stochastic, ob)
+            else:
+                _, vpred, _, _ = pi.act(stochastic, ob)
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -86,62 +284,98 @@ def add_vtarg_and_adv(seg, gamma, lam):
         gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
+
+def cfc_step(observation, pi, vf_pi, stochastic=True):
+    # get the action from the CfC model
+    action_probs = pi.predict(observation)[0]
+    if stochastic:
+        action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
+    else:
+        action = np.argmax(action_probs)
+    # get the vpred from the value function model
+    vpred = vf_pi.predict(np.expand_dims(action_probs, axis=0))[0][0]
+    return action, vpred
+
+
 def learn(*,
-        network,
+        policy_fn,
+        value_fn,
         env,
-        total_timesteps,
-        timesteps_per_batch=1024, # what to train on
-        max_kl=0.001,
-        cg_iters=10,
-        gamma=0.99,
-        lam=1.0, # advantage estimation
+        total_timesteps=0,
+        timesteps_per_batch, # what to train on
+        cg_iters,
+        gamma,
+        lam, # advantage estimation
         seed=None,
         ent_coef=0.0,
         cg_damping=1e-2,
         vf_stepsize=3e-4,
-        vf_iters =3,
+        vf_iters=3,
         max_episodes=0, max_iters=0,  # time constraint
+        policy_save_freq=50, 
+        expert_dir=None, 
+        ilrate_multi=0.0, 
+        ilrate_decay=1.0, 
+        hard_switch_iter=None, 
+        save_no_policy=False, 
+        pretrain_dir=None,  
+        il_gae=False,
         callback=None,
-        load_path=None,
-        **network_kwargs
+        deterministic_expert=False,
+        initialize_with_expert_logstd=False
         ):
     '''
-    learn a policy function with TRPO algorithm
+    learn a policy function with TRPO algorithm. There are some changes in this function to accomodate the LOKI algorithm.
+    The parameters network and network_kwargs have been removed. The following parameters have been added:
+    policy_fn, policy_save_freq, expert_dir, ilrate_multi, ilrate_decay, hard_switch_iter, trunctated_horizon, save_no_policy,
+    pretrain_dir, il_gae. initlialize_with_expert_logstd. 
 
     Parameters:
     ----------
 
-    network                 neural network to learn. Can be either string ('mlp', 'cnn', 'lstm', 'lnlstm' for basic types)
-                            or function that takes input placeholder and returns tuple (output, None) for feedforward nets
-                            or (output, (state_placeholder, state_output, mask_placeholder)) for recurrent nets
+    policy_fn               policy function
 
     env                     environment (one of the gym environments or wrapped via baselines.common.vec_env.VecEnv-type class
 
     timesteps_per_batch     timesteps per gradient estimation batch
 
-    max_kl                  max KL divergence between old policy and new policy ( KL(pi_old || pi) )
-
     ent_coef                coefficient of policy entropy term in the optimization objective
 
-    cg_iters                number of iterations of conjugate gradient algorithm
-
     cg_damping              conjugate gradient damping
+
+    cg_iters                number of conjugate gradient iterations per optimization step
 
     vf_stepsize             learning rate for adam optimizer used to optimie value function loss
 
     vf_iters                number of iterations of value function optimization iterations per each policy optimization step
 
-    total_timesteps           max number of timesteps
+    total_timesteps         max number of timesteps
 
     max_episodes            max number of episodes
 
     max_iters               maximum number of policy optimization iterations
 
+    policy_save_freq        frequency of saving the policy
+
+    expert_dir              directory where the expert policies are stored
+
+    ilrate_multi            multiplier for the inverse reinforcement learning rate
+
+    ilrate_decay            decay rate for the inverse reinforcement learning rate
+
+    hard_switch_iter        iteration at which the inverse reinforcement learning rate is set to zero
+
+    save_no_policy          boolean indicating whether to save the model without the policy
+
+    pretrain_dir            directory where the pre-trained policy is stored
+
+    il_gae                  boolean indicating whether to use generalized advantage estimation for inverse reinforcement learning
+    
     callback                function to be called with (locals(), globals()) each policy optimization step
 
-    load_path               str, path to load the model from (default: None, i.e. no model is loaded)
+    deterministic_expert    boolean indicating whether the expert policy is deterministic
 
-    **network_kwargs        keyword arguments to the policy / network builder. See baselines.common/policies.py/build_policy and arguments to a particular type of network
+    initialize_with_expert_logstd    boolean indicating whether to initialize the policy with the logstd of the expert policy
 
     Returns:
     -------
@@ -164,8 +398,9 @@ def learn(*,
             intra_op_parallelism_threads=cpus_per_worker
     ))
 
+    grad_batch_size = 64
+    # pretrain_rollouts_file = 'pretrain_rollouts.npz'  # Has to check what this does
 
-    policy = build_policy(env, network, value_network='copy', **network_kwargs)
     set_global_seeds(seed)
 
     np.set_printoptions(precision=3)
@@ -176,14 +411,37 @@ def learn(*,
 
     ob = observation_placeholder(ob_space)
     with tf.variable_scope("pi"):
-        pi = policy(observ_placeholder=ob)
+        pi = policy_fn("pi", ob_space, ac_space) # Construct network for new policy, unfinished in LOKI, might be changes
     with tf.variable_scope("oldpi"):
-        oldpi = policy(observ_placeholder=ob)
+        oldpi = policy_fn("oldpi", ob_space, ac_space) # Network for old policy
+    with tf.variable_scope("pi_vf"):
+        pi_vf= value_fn("pi_vf", ob_space, ac_space) # Network for old policy
+
+    # Robin: If we're going to import an expert then uncomment this
+    #if expert_dir:
+    #    assert os.path.isdir(expert_dir)
+    #expert = None if not expert_dir else policy_fn("expert", ob_space, ac_space)
+    #if expert_dir:
+    #    expert_saver = create_saver(expert, for_expert=True)
+    #    expert_path = os.path.join(expert_dir, 'expert.ckpt')
+    #if pretrain_dir:
+    #    pretrain_path = os.path.join(pretrain_dir, 'pretrained.ckpt')
 
     atarg = tf.placeholder(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
     ret = tf.placeholder(dtype=tf.float32, shape=[None]) # Empirical return
 
+    # created in MlpPolicy (Robin: Which we have to change) init, 2d tensor 
+    ob = U.get_placeholder_cached(name="ob")
+
     ac = pi.pdtype.sample_placeholder([None])
+    ac_scale = tf.placeholder(dtype=tf.float32, shape=[ac.shape[1]])
+    ilrew_ph = tf.placeholder(dtype=tf.float32, shape=[None])  # imitation learning reward, maybe needed for ilgain
+    ilrate = tf.placeholder(dtype=tf.float32, shape=[])  # a float scalar
+    phs = [ob, ac, atarg, ilrew_ph, ilrate, ac_scale]  # placeholders
+    assign_updates = [tf.assign(oldv, newv) for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())]
+    assign_old_eq_new = U.function([], [], updates=assign_updates)
+    # Make sure trainable policy parameters are only from pi.
+    all_var_list = pi.get_trainable_variables()
 
     kloldnew = oldpi.pd.kl(pi.pd)
     ent = pi.pd.entropy()
@@ -191,23 +449,35 @@ def learn(*,
     meanent = tf.reduce_mean(ent)
     entbonus = ent_coef * meanent
 
-    vferr = tf.reduce_mean(tf.square(pi.vf - ret))
+    # Build up. 
+    # Value function objective.
+    vferr = tf.reduce_mean(tf.square(pi.vpred - ret))
 
-    ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac)) # advantage * pnew / pold
-    surrgain = tf.reduce_mean(ratio * atarg)
-
+    # Policy gradient objective. Lots of changes from baselines to accomodate for LOKI
+    ent = pi.pd.entropy()
+    meanent = tf.reduce_mean(ent)
+    entbonus = ent_coef * meanent
+    ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac))  # advantage * pnew / pold
+    rlgain = tf.reduce_mean(ratio * atarg)
+    ilgain = tf.constant(0.0) # Chaned from original LOKI code as it was not made for our purpose
+    surrgain = ilgain * ilrate + (1 - ilrate) * rlgain
     optimgain = surrgain + entbonus
-    losses = [optimgain, meankl, entbonus, surrgain, meanent]
-    loss_names = ["optimgain", "meankl", "entloss", "surrgain", "entropy"]
+    kloldnew = oldpi.pd.kl(pi.pd)
+    meankl = tf.reduce_mean(kloldnew)
+    losses = [optimgain, meankl, entbonus, ilgain, rlgain, surrgain, meanent]
+    loss_names = ["optimgain", "meankl", "entloss", "ilgain", "rlgain", "surrgain", "entropy"]
+    compute_losses = U.function(phs, losses)
+    compute_lossandgrad = U.function(phs, losses + [U.flatgrad(optimgain, var_list)])
 
     dist = meankl
 
-    all_var_list = get_trainable_variables("pi")
+    # all_var_list = get_trainable_variables("pi")
     # var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("pol")]
     # vf_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("vf")]
     var_list = get_pi_trainable_variables("pi")
     vf_var_list = get_vf_trainable_variables("pi")
 
+    # value function is using adam, and policy is not.
     vfadam = MpiAdam(vf_var_list)
 
     get_flat = U.GetFlat(var_list)
@@ -229,7 +499,12 @@ def learn(*,
 
     compute_losses = U.function([ob, ac, atarg], losses)
     compute_lossandgrad = U.function([ob, ac, atarg], losses + [U.flatgrad(optimgain, var_list)])
-    compute_fvp = U.function([flat_tangent, ob, ac, atarg], fvp)
+    compute_fvp = U.function([flat_tangent] + [ob, ac], fvp)  # not sure why atarg and ilrew are needed
+    # in spite of the name, only grad is computed. This is changed from baselines.
+    # ret will be fed by tdlamret, which is adv + vpred, and
+    # vferr: tf.reduce_mean(tf.square(pi.vpred - ret))
+    # It seems that he is not estimate V^{\pi, \gamma} (Eq.4 in trpo-gae paper), instead some weird stuff:
+    # A^{GAE} in Eq.25 + \hat V_t
     compute_vflossandgrad = U.function([ob, ret], U.flatgrad(vferr, vf_var_list))
 
     @contextmanager
@@ -254,8 +529,34 @@ def learn(*,
         return out
 
     U.initialize()
-    if load_path is not None:
-        pi.load(load_path)
+    
+    # This was removed in LOKI
+    #if load_path is not None:
+    #    pi.load(load_path)
+
+    # This is two imports are from LOKI
+    if expert_dir:
+        print('Restoring expert')
+        expert_saver = create_saver("expert", for_expert=True)
+        expert_saver.restore(tf.get_default_session(), expert_dir)
+        with tf.variable_scope("expert", reuse=True):
+            with tf.variable_scope("pol", reuse=True):
+                logstd = tf.get_variable(name="logstd")
+                expert_logstd = logstd.eval()
+        with tf.variable_scope("pi", reuse=True):
+            with tf.variable_scope("pol", reuse=True):
+                logstd = tf.get_variable(name="logstd")
+                print('Expert logstd: {expert_logstd}')
+
+    if pretrain_dir:
+        print('Initialize learner with pretrained model')
+        policy_saver = create_saver("pi", for_expert=False)
+        policy_saver.restore(tf.get_default_session(), pretrain_dir)
+        assign_old_eq_new()
+        with tf.variable_scope("pi", reuse=True):
+            with tf.variable_scope("pol", reuse=True):
+                logstd = tf.get_variable(name="logstd")
+                print(f'Pretrain policy logstd: {logstd.eval()}')
 
     th_init = get_flat()
     if MPI is not None:
@@ -267,7 +568,14 @@ def learn(*,
 
     # Prepare for rollouts
     # ----------------------------------------
-    seg_gen = traj_segment_generator(pi, env, timesteps_per_batch, stochastic=True)
+    # This is from LOKI
+    pretrain_il = False # set true id you want to pretrain with IL
+    if pretrain_il: # Script which takes keyboard input to play atari
+        assert expert # Robin: Expert is not made yet as it's our input
+        seg_gen = traj_segment_generator(expert, env=env, horizon=timesteps_per_batch,
+                                         stochastic=not deterministic_expert, expert=True)
+    else:
+        seg_gen = traj_segment_generator(pi, env, timesteps_per_batch, stochastic=True)
 
     episodes_so_far = 0
     timesteps_so_far = 0
@@ -276,7 +584,7 @@ def learn(*,
     lenbuffer = deque(maxlen=40) # rolling buffer for episode lengths
     rewbuffer = deque(maxlen=40) # rolling buffer for episode rewards
 
-    if sum([max_iters>0, total_timesteps>0, max_episodes>0])==0:
+    if sum([max_iters>0, total_timesteps>0, max_episodes>0])==0: 
         # noththing to be done
         return pi
 
@@ -291,34 +599,74 @@ def learn(*,
             break
         elif max_iters and iters_so_far >= max_iters:
             break
-        logger.log("********** Iteration %i ************"%iters_so_far)
+        logger.log(f"********** Iteration {iters_so_far} ************")
 
         with timed("sampling"):
-            seg = seg_gen.__next__()
+            if pretrain_il:
+                # assert rank == 0  # only one worker! Not sure why now....
+                if iters_so_far == 0:
+                    seg = seg_gen.__next__()
+                    ac_scale_val = np.std(seg["ac"], axis=0) if rank == 0 else np.ones(seg["ac"][0].shape)
+                else:
+                    # need to update vpred, nextvpred in seg!
+                    seg['vpred'] = batch_value_prediction(pi, seg["ob"])
+                    _, seg['nextvpred'] = cfc_step(True, seg['nextob'])
+            else:
+                seg = seg_gen.__next__()
+                if iters_so_far == 0:
+                    ac_scale_val = np.ones(seg["ac"][0].shape)
+                    if expert_dir:
+                        print('Generating expert rollouts for action scaling')
+                        if rank == 0:
+                            expert_seg_gen = traj_segment_generator(expert, env, 4 * timesteps_per_batch, stochastic=True)
+                            expert_seg = next(expert_seg_gen)
+                            ac_scale_val = np.std(expert_seg["ac"], axis=0)
+        print(f"ac_scale_val: {ac_scale_val}")
+
         add_vtarg_and_adv(seg, gamma, lam)
 
+        # From LOKI
+        seg["ilrew"] = seg["rew"]
+
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
-        ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
+        ob_val, ac, atarg, tdlamret, ilrew = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"], seg["ilrew"] # Changes from LOKI
+        
+        # From LOKI. This is very the switch from IL to RL happens by changing the kl weight
+        ilrate_val = compute_ilrate(ilrate_multi, iters_so_far, ilrate_decay, hard_switch_iter)
+        max_kl = compute_max_kl(ilrate_val) 
+        print(f"Max KL: {max_kl}")
+        
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
+
+        # From LOKI
+        if not np.allclose(ilrew.std(), 0.0):
+            ilrew = (ilrew - ilrew.mean()) / ilrew.std()
+        else:
+            ilrew = (ilrew - ilrew.mean())
 
         if hasattr(pi, "ret_rms"): pi.ret_rms.update(tdlamret)
         if hasattr(pi, "ob_rms"): pi.ob_rms.update(ob) # update running mean/std for policy
 
-        args = seg["ob"], seg["ac"], atarg
-        fvpargs = [arr[::5] for arr in args]
+        lossargs = [ob_val, ac] # from LOKI
+        fvpargs = [arr[::5] for arr in lossargs]
+        lossargs += [atarg, ilrew, ilrate_val, ac_scale_val]
+
         def fisher_vector_product(p):
             return allmean(compute_fvp(p, *fvpargs)) + cg_damping * p
 
         assign_old_eq_new() # set old parameter values to new parameter values
         with timed("computegrad"):
-            *lossbefore, g = compute_lossandgrad(*args)
+            *lossbefore, g = compute_lossandgrad(*lossargs)
         lossbefore = allmean(np.array(lossbefore))
         g = allmean(g)
         if np.allclose(g, 0):
             logger.log("Got zero gradient. not updating")
         else:
             with timed("cg"):
+                # g: gradient over processes,
+                # fisher_vector_product: after compute kl stuff using samples from local process, uses mpi
+                # aggregate them. Although some computation can be saved in cg.
                 stepdir = cg(fisher_vector_product, g, cg_iters=cg_iters, verbose=rank==0)
             assert np.isfinite(stepdir).all()
             shs = .5*stepdir.dot(fisher_vector_product(stepdir))
@@ -332,7 +680,7 @@ def learn(*,
             for _ in range(10):
                 thnew = thbefore + fullstep * stepsize
                 set_from_flat(thnew)
-                meanlosses = surr, kl, *_ = allmean(np.array(compute_losses(*args)))
+                meanlosses = surr, kl, *_ = allmean(np.array(compute_losses(*lossargs))) # From LOKI change *args to *lossargs
                 improve = surr - surrbefore
                 logger.log("Expected: %.3f Actual: %.3f"%(expectedimprove, improve))
                 if not np.isfinite(meanlosses).all():
@@ -359,7 +707,7 @@ def learn(*,
 
             for _ in range(vf_iters):
                 for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]),
-                include_final_partial_batch=False, batch_size=64):
+                include_final_partial_batch=False, batch_size=grad_batch_size):
                     g = allmean(compute_vflossandgrad(mbob, mbret))
                     vfadam.update(g, vf_stepsize)
 
@@ -385,11 +733,23 @@ def learn(*,
         logger.record_tabular("EpisodesSoFar", episodes_so_far)
         logger.record_tabular("TimestepsSoFar", timesteps_so_far)
         logger.record_tabular("TimeElapsed", time.time() - tstart)
+        logger.record_tabular("ilrate", ilrate_val)
 
         if rank==0:
             logger.dump_tabular()
-
-    return pi
+            # Robin: This must be fixed or removed
+            '''
+            if iters_so_far % policy_save_freq == 0 and not save_no_policy:
+                prefix = '{}_{}'.format(policy_files_prefix, iters_so_far)
+                save_path = policy_saver.save(tf.get_default_session(), os.path.join(policy_dir, prefix + '.ckpt'))
+                print(f'Intemediate policy has been saved to {save_path}')
+            print('Print logstd:')
+            with tf.variable_scope("pi", reuse=True):
+                with tf.variable_scope("pol", reuse=True):
+                    logstd = tf.get_variable(name="logstd")
+                    print(logstd.eval())
+            '''
+    return pi, atarg
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]

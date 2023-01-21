@@ -3,6 +3,8 @@ import tensorflow as tf
 from baselines.a2c import utils
 from baselines.a2c.utils import conv, fc, conv_to_fc, batch_to_seq, seq_to_batch
 from baselines.common.mpi_running_mean_std import RunningMeanStd
+from ncps.tf import CfC
+from ncps import wirings
 
 mapping = {}
 
@@ -99,6 +101,40 @@ def mlp(num_layers=2, num_hidden=64, activation=tf.tanh, layer_norm=False):
             h = activation(h)
 
         return h
+
+    return network_fn
+
+@register("mlp_vf")
+def mlp_vf(num_layers=2, num_hidden=64, activation=tf.tanh, layer_norm=False):
+    """
+    Stack of fully-connected layers to be used in a policy / q-function approximator
+
+    Parameters:
+    ----------
+
+    num_layers: int                 number of fully-connected layers (default: 2)
+
+    num_hidden: int                 size of fully-connected layers (default: 64)
+
+    activation:                     activation function (default: tf.tanh)
+
+    Returns:
+    -------
+
+    function that builds fully connected network with a given input tensor / placeholder
+    """
+    def network_fn(X):
+        h = tf.layers.flatten(X)
+        for i in range(num_layers):
+            h = fc(h, 'mlp_fc{}'.format(i), nh=num_hidden, init_scale=np.sqrt(2))
+            if layer_norm:
+                h = tf.contrib.layers.layer_norm(h, center=True, scale=True)
+            h = activation(h)
+
+        # add a final dense layer with a single output
+        vpred = tf.layers.dense(h, 1, name='vpred')
+
+        return vpred
 
     return network_fn
 
@@ -247,6 +283,37 @@ def conv_only(convs=[(32, 8, 4), (64, 4, 2), (64, 3, 1)], **conv_kwargs):
 
         return out
     return network_fn
+
+@register("CfC")
+def CfC(num_neurons=124, num_outputs=3):
+    """
+    Create a CfC neural network with a specified number of neurons and output neurons
+    
+    Parameters:
+    ----------
+    num_neurons: int
+        The number of neurons in the CfC network, default is 124
+    num_outputs: int
+        The number of output neurons, default is 3
+    Returns:
+    -------
+    A function that builds a CfC network with a given input tensor/placeholder
+    
+    Example:
+    --------
+    >>> model_fn = CfC()
+    >>> X_ph = tf.placeholder(shape=(None, 300), dtype=tf.float32)
+    >>> model = model_fn(X_ph)
+    """
+    wiring = wirings.AutoNCP(num_neurons,num_outputs) 
+    def network_fn(X):
+        model = keras.models.Sequential()
+        model.add(keras.layers.InputLayer(input_shape=(None, X.shape[-1])))
+        model.add(CfC(wiring, return_sequences=True))
+        model.compile(optimizer=keras.optimizers.Adam(0.01), loss='mean_squared_error')
+        return model
+    return network_fn  
+
 
 def _normalize_clip_observation(x, clip_range=[-5.0, 5.0]):
     rms = RunningMeanStd(shape=x.shape[1:])
