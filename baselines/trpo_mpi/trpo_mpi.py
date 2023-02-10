@@ -386,11 +386,10 @@ def learn(policy_fn,
         rank = 0
 
     cpus_per_worker = 1
-    U.get_session(config=tf.ConfigProto(
-            allow_soft_placement=True,
-            inter_op_parallelism_threads=cpus_per_worker,
-            intra_op_parallelism_threads=cpus_per_worker
-    ))
+
+    tf.config.set_soft_device_placement=True
+    tf.config.threading.set_inter_op_parallelism_threads=cpus_per_worker
+    tf.config.threading.set_intra_op_parallelism_threads=cpus_per_worker
 
     grad_batch_size = 64
     # pretrain_rollouts_file = 'pretrain_rollouts.npz'  # Has to check what this does
@@ -420,16 +419,16 @@ def learn(policy_fn,
     #if pretrain_dir:
     #    pretrain_path = os.path.join(pretrain_dir, 'pretrained.ckpt')
 
-    atarg = tf.placeholder(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
-    ret = tf.placeholder(dtype=tf.float32, shape=[None]) # Empirical return
+    atarg = tf.keras.Input(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
+    ret = tf.keras.Input(dtype=tf.float32, shape=[None]) # Empirical return
 
     # created in MlpPolicy (Robin: Which we have to change) init, 2d tensor 
     ob = U.get_placeholder_cached(name="ob")
 
     ac = pi.pdtype.sample_placeholder([None])
-    ac_scale = tf.placeholder(dtype=tf.float32, shape=[ac.shape[1]])
-    ilrew_ph = tf.placeholder(dtype=tf.float32, shape=[None])  # imitation learning reward, maybe needed for ilgain
-    ilrate = tf.placeholder(dtype=tf.float32, shape=[])  # a float scalar
+    ac_scale = tf.keras.Input(dtype=tf.float32, shape=[ac.shape[1]])
+    ilrew_ph = tf.keras.Input(dtype=tf.float32, shape=[None])  # imitation learning reward, maybe needed for ilgain
+    ilrate = tf.keras.Input(dtype=tf.float32, shape=[])  # a float scalar
     phs = [ob, ac, atarg, ilrew_ph, ilrate, ac_scale]  # placeholders
     assign_updates = [tf.assign(oldv, newv) for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())]
     assign_old_eq_new = U.function([], [], updates=assign_updates)
@@ -476,7 +475,7 @@ def learn(policy_fn,
     get_flat = U.GetFlat(var_list)
     set_from_flat = U.SetFromFlat(var_list)
     klgrads = tf.gradients(dist, var_list)
-    flat_tangent = tf.placeholder(dtype=tf.float32, shape=[None], name="flat_tan")
+    flat_tangent = tf.keras.Input(dtype=tf.float32, shape=[None], name="flat_tan")
     shapes = [var.get_shape().as_list() for var in var_list]
     start = 0
     tangents = []
