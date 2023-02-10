@@ -1,8 +1,8 @@
-from baselines.baselines.common.mpi_running_mean_std import RunningMeanStd
-import baselines.baselines.common.tf_util as U
+from baselines.common.mpi_running_mean_std import RunningMeanStd
+import baselines.common.tf_util as U
 import tensorflow as tf
 import gym
-from baselines.baselines.common.distributions import make_pdtype
+from baselines.common.distributions import make_pdtype
 import numpy as np
 from ncps.tf import CfC
 from ncps import wirings
@@ -24,13 +24,6 @@ class CfCPolicy(object):
         sequence_length = None
 
         ob = U.get_placeholder(name="ob", dtype=tf.float32, shape=[sequence_length] + list(ob_space.shape))
-
-        input_layer = tf.keras.layers.Input(
-            shape=(None, ob_space.shape[0] * ob_space.shape[1] * ob_space.shape[2]),
-            name="inputs"
-            )
-        seq_in = tf.keras.layers.Input(shape=(), name="seq_in", dtype=tf.int32)
-        state_in_h = tf.keras.layers.Input(shape=(hid_size*num_hid_layers,), name="h")
 
 
         with tf.variable_scope("obfilter"):
@@ -80,7 +73,8 @@ class CfCPolicy(object):
         self.state_in = []
         self.state_out = []
 
-        stochastic = tf.placeholder(dtype=tf.bool, shape=())
+        # TF1: stochastic = tf.placeholder(dtype=tf.bool, shape=())
+        stochastic = tf.Variable(False, dtype=tf.bool, name='stochastic')
         ac = self.pd.sample()
         self._act = U.function([stochastic, ob], [ac, self.vpred])
 

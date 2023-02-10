@@ -341,5 +341,3 @@ def get_network_builder(name):
     else:
         raise ValueError('Unknown network type: {}'.format(name))
 
-@register("cnn_CfC")
-def cnn_CfC(num_neurons=124, num_outputs=3):

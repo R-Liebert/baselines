@@ -292,20 +292,20 @@ def cfc_step(observation, pi, vf_pi, stochastic=True):
     return action, vpred
 
 
-def learn(*,
-        policy_fn,
+def learn(policy_fn,
         env,
-        total_timesteps=0,
         timesteps_per_batch, # what to train on
         cg_iters,
         gamma,
         lam, # advantage estimation
+        total_timesteps=0,
         seed=None,
         ent_coef=0.0,
         cg_damping=1e-2,
         vf_stepsize=3e-4,
         vf_iters=3,
         max_episodes=0, max_iters=0,  # time constraint
+        mode = True,
         policy_save_freq=50, 
         expert_dir=None, 
         ilrate_multi=0.0, 
