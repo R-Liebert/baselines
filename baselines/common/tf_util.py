@@ -241,7 +241,7 @@ class SetFromFlat(object):
         shapes = list(map(var_shape, var_list))
         total_size = np.sum([intprod(shape) for shape in shapes])
 
-        self.theta = theta = tf.placeholder(dtype, [total_size])
+        self.theta = theta = tf.keras.Input(dtype, [total_size])
         start = 0
         assigns = []
         for (shape, v) in zip(shapes, var_list):
@@ -277,7 +277,7 @@ def get_placeholder(name, dtype, shape):
                 'Placeholder with name {} has already been registered and has shape {}, different from requested {}'.format(name, shape1, shape)
             return out
 
-    out = tf.placeholder(dtype=dtype, shape=shape, name=name)
+    out = tf.keras.Input(dtype=dtype, shape=shape, name=name)
     _PLACEHOLDER_CACHE[name] = (out, dtype, shape)
     return out
 
