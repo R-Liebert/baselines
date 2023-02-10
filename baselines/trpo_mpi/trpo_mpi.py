@@ -226,11 +226,6 @@ def traj_segment_generator(pi, env, horizon, stochastic=True, expert=False):
 
     while True:
         prevac = ac
-        # In the original LOKI script there was an older version of baselines which used
-        # pi.act(stochastic, ob) instead of cfc_step(ob,  stochastic). The update was made to 
-        # introduce more flexibility and allow for the use of recurrent policies.
-        # This is found through the whole script, but in TRPO it's only ac and vpred being used.
-        # So there is noe effect on the results when used on the policy.
         if expert:
             ac, vpred, _, _ = pi.act(stochastic, ob)
         else:
