@@ -4,7 +4,7 @@ cv2.ocl.setUseOpenCL(False)
 from .atari_wrappers import WarpFrame, ClipRewardEnv, FrameStack, ScaledFloatFrame
 from .wrappers import TimeLimit
 import numpy as np
-import gym
+import gymnasium as gym
 
 
 class StochasticFrameSkip(gym.Wrapper):

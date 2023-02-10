@@ -294,7 +294,6 @@ def cfc_step(observation, pi, vf_pi, stochastic=True):
 
 def learn(*,
         policy_fn,
-        value_fn,
         env,
         total_timesteps=0,
         timesteps_per_batch, # what to train on
@@ -409,8 +408,7 @@ def learn(*,
         pi = policy_fn("pi", ob_space, ac_space) # Construct network for new policy, unfinished in LOKI, might be changes
     with tf.variable_scope("oldpi"):
         oldpi = policy_fn("oldpi", ob_space, ac_space) # Network for old policy
-    with tf.variable_scope("pi_vf"):
-        pi_vf= value_fn("pi_vf", ob_space, ac_space) # Network for old policy
+    
 
     # Robin: If we're going to import an expert then uncomment this
     #if expert_dir:
