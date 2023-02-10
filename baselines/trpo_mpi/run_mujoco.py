@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # noinspection PyUnresolvedReferences
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 from baselines.common.cmd_util import make_mujoco_env, mujoco_arg_parser
 import baselines.common.tf_util as U
 from baselines import logger
-from baselines.ppo1.mlp_policy import MlpPolicy
+from baselines.trpo_mpi.cfc_policy import CfCPolicy
 from baselines.trpo_mpi import trpo_mpi
 import os.path as osp
 import numpy as np
@@ -15,17 +18,21 @@ def main():
     add_other_args(parser)
     args = parser.parse_args()
 
-    rank = MPI.COMM_WORLD.Get_rank()
+    if MPI is not None:
+        rank = MPI.COMM_WORLD.Get_rank()
+    else:
+        rank = 0
+
     if rank == 0:
         logger.configure(osp.join(args.workspace, args.log_dir))
     else:
         logger.configure(osp.join(args.workspace, args.log_dir), format_strs=[])
         logger.set_level(logger.DISABLED)
 
-    workerseed = args.seed + 10000 * MPI.COMM_WORLD.Get_rank()
+    workerseed = args.seed + (10000 * MPI.COMM_WORLD.Get_rank() if rank != 0 else 0)
 
     def policy_fn(name, ob_space, ac_space):
-        return MlpPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
+        return CfCPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
                          hid_size=32, num_hid_layers=2)
     env = make_mujoco_env(args.env, workerseed)
     expert_dir = None if args.expert_dir is None else osp.join(args.workspace, args.expert_dir)
