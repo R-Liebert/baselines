@@ -67,8 +67,7 @@ def make_session(config=None, num_cpu=None, make_default=False, graph=None):
 
     if make_default:
         return tf.InteractiveSession(config=config, graph=graph)
-    else:
-        return tf.Session(config=config, graph=graph)
+    
 
 def single_threaded_session():
     """Returns a session which will only use a single CPU"""

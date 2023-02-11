@@ -403,10 +403,8 @@ def learn(policy_fn,
     ac_space = env.action_space
 
     ob = observation_placeholder(ob_space)
-    with tf.variable_scope("pi"):
-        pi = policy_fn("pi", ob_space, ac_space) # Construct network for new policy, unfinished in LOKI, might be changes
-    with tf.variable_scope("oldpi"):
-        oldpi = policy_fn("oldpi", ob_space, ac_space) # Network for old policy
+    pi = policy_fn("pi", ob_space, ac_space) # Construct network for new policy, unfinished in LOKI, might be changes
+    oldpi = policy_fn("oldpi", ob_space, ac_space) # Network for old policy
     
 
     # Robin: If we're going to import an expert then uncomment this
@@ -531,24 +529,20 @@ def learn(policy_fn,
         print('Restoring expert')
         expert_saver = create_saver("expert", for_expert=True)
         expert_saver.restore(tf.get_default_session(), expert_dir)
-        with tf.variable_scope("expert", reuse=True):
-            with tf.variable_scope("pol", reuse=True):
-                logstd = tf.get_variable(name="logstd")
-                expert_logstd = logstd.eval()
-        with tf.variable_scope("pi", reuse=True):
-            with tf.variable_scope("pol", reuse=True):
-                logstd = tf.get_variable(name="logstd")
-                print('Expert logstd: {expert_logstd}')
+
+        logstd = tf.get_variable(name="logstd")
+        expert_logstd = logstd.eval()
+
+        print('Expert logstd: {expert_logstd}')
 
     if pretrain_dir:
         print('Initialize learner with pretrained model')
         policy_saver = create_saver("pi", for_expert=False)
         policy_saver.restore(tf.get_default_session(), pretrain_dir)
         assign_old_eq_new()
-        with tf.variable_scope("pi", reuse=True):
-            with tf.variable_scope("pol", reuse=True):
-                logstd = tf.get_variable(name="logstd")
-                print(f'Pretrain policy logstd: {logstd.eval()}')
+
+        logstd = tf.get_variable(name="logstd")
+        print(f'Pretrain policy logstd: {logstd.eval()}')
 
     th_init = get_flat()
     if MPI is not None:
